@@ -296,6 +296,7 @@ class Qwen3TTSModel:
         subtalker_top_p: Optional[float] = None,
         subtalker_temperature: Optional[float] = None,
         max_new_tokens: Optional[int] = None,
+        min_new_tokens: Optional[int] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -349,6 +350,9 @@ class Qwen3TTSModel:
             subtalker_temperature=pick("subtalker_temperature", subtalker_temperature),
             max_new_tokens=pick("max_new_tokens", max_new_tokens),
         )
+        # Add min_new_tokens if explicitly provided (no default picking needed)
+        if min_new_tokens is not None:
+            merged["min_new_tokens"] = min_new_tokens
         return merged
 
     # voice clone model
@@ -609,8 +613,25 @@ class Qwen3TTSModel:
             **gen_kwargs,
         )
 
+        # Get the correct codec EOS token ID from model config
+        codec_eos_id = self.model.config.talker_config.codec_eos_token_id  # 4198, not 2150
+        
         codes_for_decode = []
         for i, codes in enumerate(talker_codes_list):
+            # Check for EOS token and truncate if present
+            # Although effective_lengths handled by generate, sometimes artifacts remain
+            # Use codec_eos_token_id (4198) from model config, not talker's eos_token_id (2150)
+            # Only check the first codebook (dim=-1 index 0) for EOS token, consistent with model's internal logic
+            if codes.shape[0] > 0 and codes.shape[1] > 0:
+                first_codebook = codes[:, 0]  # Check only first codebook
+                eos_mask = (first_codebook == codec_eos_id)  # (T,)
+                if eos_mask.any():
+                    # Find first occurrence
+                    first_eos = (eos_mask.cumsum(dim=0) > 0).float().argmax().item()
+                    # Truncate at EOS position to prevent audio artifacts
+                    # If EOS is at the last position, remove it; if earlier, truncate there
+                    codes = codes[:first_eos] if first_eos < codes.shape[0] else codes[:-1]
+
             ref_code_list = voice_clone_prompt_dict.get("ref_code", None)
             if ref_code_list is not None and ref_code_list[i] is not None:
                 codes_for_decode.append(torch.cat([ref_code_list[i].to(codes.device), codes], dim=0))
@@ -625,7 +646,25 @@ class Qwen3TTSModel:
             if ref_code_list is not None and ref_code_list[i] is not None:
                 ref_len = int(ref_code_list[i].shape[0])
                 total_len = int(codes_for_decode[i].shape[0])
-                cut = int(ref_len / max(total_len, 1) * wav.shape[0])
+                new_audio_len = total_len - ref_len
+                
+                # Calculate cut position based on ref_len ratio
+                # Add small margin (3 frames ~120ms) to ensure ref_audio tail is removed
+                # But cap the margin to avoid cutting into generated audio
+                margin = min(3, new_audio_len // 4) if new_audio_len > 0 else 0
+                safe_ref_len = ref_len + margin
+                
+                cut = int(safe_ref_len / max(total_len, 1) * wav.shape[0])
+                
+                # Ensure we don't cut too much - leave at least 50% of generated audio
+                min_remaining = int(new_audio_len / 2 / max(total_len, 1) * wav.shape[0])
+                max_cut = wav.shape[0] - min_remaining
+                if cut > max_cut:
+                    cut = max_cut
+                
+                if cut < 0:
+                    cut = 0
+
                 wavs_out.append(wav[cut:])
             else:
                 wavs_out.append(wav)

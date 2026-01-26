@@ -2039,11 +2039,12 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         subtalker_temperature: float = 0.9,
         eos_token_id: Optional[int] = None,
         repetition_penalty: float = 1.05,
+        min_new_tokens: int = 2,
         **kwargs,
     ):
         talker_kwargs = {
             "max_new_tokens": max_new_tokens,
-            "min_new_tokens": 2,
+            "min_new_tokens": min_new_tokens,
             "do_sample": do_sample,
             "top_k": top_k,
             "top_p": top_p,
@@ -2062,8 +2063,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 if i not in (self.config.talker_config.codec_eos_token_id,)
             ],
             "output_hidden_states": getattr(kwargs, "output_hidden_states", True),
-            "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True)
+            "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True),
+            "streamer": kwargs.get("streamer", None),
         }
+        
         
         talker_input_embeds = [[] for _ in range(len(input_ids))]
 
@@ -2278,12 +2281,14 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         )
 
         talker_codes = torch.stack([hid[-1] for hid in talker_result.hidden_states if hid[-1] is not None], dim=1)
+        
         talker_hidden_states = torch.cat([hid[0][-1][:, -1:] for hid in talker_result.hidden_states], dim=1)[:, :-1]
         
         first_codebook = talker_codes[:, :, 0]
         is_stop_token = (first_codebook ==  self.config.talker_config.codec_eos_token_id)
         stop_indices = torch.argmax(is_stop_token.int(), dim=1)
         has_stop_token = is_stop_token.any(dim=1)
+        
         effective_lengths = torch.where(has_stop_token, stop_indices, talker_codes.shape[1])
         
         talker_codes_list = [talker_codes[i, :length, ] for i, length in enumerate(effective_lengths)]
